@@ -1,0 +1,53 @@
+name: Generate git score TCG card
+
+on:
+  # Run manually from the Actions tab, optionally overriding the username
+  workflow_dispatch:
+    inputs:
+      username:
+        description: "GitHub username to render (defaults to the repo owner)"
+        required: false
+        default: ""
+  # Keep the card's stats fresh automatically
+  schedule:
+    - cron: "0 6 * * *"   # every day at 06:00 UTC
+  # Optional: also regenerate whenever you push to main
+  push:
+    branches: [main]
+    paths:
+      - "generate_card.py"
+
+permissions:
+  contents: write
+
+jobs:
+  build-card:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependency for cairosvg
+        run: sudo apt-get update && sudo apt-get install -y libcairo2
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate card
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          USERNAME: ${{ github.event.inputs.username }}
+        run: |
+          NAME="${USERNAME:-${{ github.repository_owner }}}"
+          python generate_card.py "$NAME" --out-dir cards --formats svg,png
+
+      - name: Commit updated card
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: refresh git score TCG card"
+          file_pattern: "cards/*"
