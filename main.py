@@ -4,16 +4,6 @@ git score TCG — turns a GitHub profile into a trading-card-game style card.
 
 Usage:
     python generate_card.py <username> [--out-dir cards] [--formats svg,png] [--token GH_TOKEN]
-
-Environment variables (used as fallbacks so it's easy to wire into GitHub Actions):
-    GITHUB_USERNAME   -> username to render, if not passed as a positional arg
-    GH_TOKEN / GITHUB_TOKEN -> token used for GitHub API auth (raises the rate limit
-                                from 60/hr to 5000/hr; also required for private stats)
-
-Outputs (into --out-dir, default "cards/"):
-    <username>.svg
-    <username>.png   (if cairosvg is available and "png" is in --formats)
-    <username>.jpg   (if cairosvg is available and "jpg" is in --formats)
 """
 
 import argparse
@@ -31,8 +21,7 @@ import requests
 API = "https://api.github.com"
 
 # ----------------------------------------------------------------------------
-# Flavor tables (purely cosmetic — mirrors the language color list from the
-# original web tool, plus an "element" mapping used for the card's Type line).
+# Flavor tables
 # ----------------------------------------------------------------------------
 LANG_COLORS = {
     "JavaScript": "#f1e05a", "TypeScript": "#3178c6", "Python": "#3572A5",
@@ -49,14 +38,12 @@ LANG_TYPE = {
     "Vue": "Nature", "Dart": "Water", "Scala": "Fire",
 }
 
-# Rarity tiers, keyed off the same 0-100 score used by the original tool.
 RARITY_TIERS = [
-    # threshold, letter, name,        gradient colors (light -> dark), text color
-    (85, "S", "MYTHIC",   ("#FDE68A", "#B8860B"), "#4A3200"),
-    (70, "A", "LEGENDARY", ("#D8B4FE", "#7C3AED"), "#2E1065"),
-    (50, "B", "RARE",      ("#93C5FD", "#1D4ED8"), "#0B2A6B"),
-    (30, "C", "UNCOMMON",  ("#A7D8B8", "#2F855A"), "#173B27"),
-    (0,  "D", "COMMON",    ("#CBD5E1", "#64748B"), "#334155"),
+    (85, "S", "MYTHIC",   ("#F59E0B", "#EF4444", "#701A75"), "#FFFFFF"),
+    (70, "A", "LEGENDARY", ("#A855F7", "#6366F1", "#1E1B4B"), "#FFFFFF"),
+    (50, "B", "RARE",      ("#3B82F6", "#06B6D4", "#0F172A"), "#FFFFFF"),
+    (30, "C", "UNCOMMON",  ("#10B981", "#059669", "#064E3B"), "#FFFFFF"),
+    (0,  "D", "COMMON",    ("#94A3B8", "#475569", "#0F172A"), "#FFFFFF"),
 ]
 
 
@@ -64,7 +51,7 @@ def rarity_for(score):
     for threshold, letter, name, colors, text_color in RARITY_TIERS:
         if score >= threshold:
             return {"letter": letter, "name": name, "colors": colors, "text": text_color}
-    return {"letter": "D", "name": "COMMON", "colors": ("#CBD5E1", "#64748B"), "text": "#334155"}
+    return {"letter": "D", "name": "COMMON", "colors": ("#94A3B8", "#475569", "#0F172A"), "text": "#FFFFFF"}
 
 
 def color_for_lang(lang):
@@ -114,12 +101,6 @@ def fetch_avatar_data_uri(url):
 
 
 def fetch_search_total(endpoint, query, token=None, accept="application/vnd.github+json"):
-    """Returns the `total_count` from a GitHub Search API endpoint, or 0 on failure.
-
-    Search results degrade gracefully (rather than raising) because the search
-    API has a much stricter rate limit than the rest of the REST API, and a
-    missed count shouldn't block the whole card from being generated.
-    """
     headers = {"Accept": accept}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -132,10 +113,8 @@ def fetch_search_total(endpoint, query, token=None, accept="application/vnd.gith
         )
         if res.status_code == 200:
             return res.json().get("total_count", 0)
-        print(f"Warning: search/{endpoint} returned {res.status_code}, counting as 0", file=sys.stderr)
         return 0
-    except Exception as e:
-        print(f"Warning: search/{endpoint} failed ({e}), counting as 0", file=sys.stderr)
+    except Exception:
         return 0
 
 
@@ -163,18 +142,13 @@ def gather_profile(login, token=None):
     followers = user.get("followers") or 0
     public_repos = user.get("public_repos") or 0
 
-    # Commit search technically only indexes default-branch commits and can
-    # lag slightly, but it's the only way to get a commit count without
-    # cloning every repo — good enough for a flavor stat.
+    # Retained safely behind the scenes to keep mathematical logic accurate
     total_commits = fetch_search_total(
         "commits", f"author:{login}", token, accept="application/vnd.github.cloak-preview+json"
     )
     total_prs = fetch_search_total("issues", f"author:{login} type:pr", token)
     total_issues = fetch_search_total("issues", f"author:{login} type:issue", token)
 
-    # Weights sum to 100. Each cap is reached at a similar "difficulty" level
-    # to the original followers/stars curve (roughly: hundreds for
-    # commits/PRs, tens for issues — see README for the full breakdown).
     s_followers = min(20, math.log2(followers + 1) * 2.667)
     s_stars = min(20, math.log2(total_stars + 1) * 2.667)
     s_repos = min(10, math.log2(public_repos + 1) * 2.0)
@@ -197,23 +171,17 @@ def gather_profile(login, token=None):
     raw_score = sum(v for v, _ in sub_scores.values())
     score = max(1, min(100, round(raw_score)))
 
-    # Blended stat-bar percentages: each bar folds in a related activity
-    # metric alongside its original profile stat. This only changes what's
-    # *displayed* in the bar fill — the score above still uses the original
-    # 8 independent sub_scores untouched.
-    #   POW = stars      + commits   (shipped code that got noticed)
-    #   DEF = followers  + issues    (community standing/engagement)
-    #   SPD = forks      + PRs       (velocity of collaborative work)
-    bar_weights = {
-        "pow": (s_stars + s_commits, 20 + 15),
-        "def": (s_followers + s_issues, 20 + 7),
-        "spd": (s_forks + s_prs, 8 + 10),
+    # Bar fills map cleanly onto core metrics directly
+    bar_pct = {
+        "pow": round(s_stars / 20 * 100),
+        "def": round(s_followers / 20 * 100),
+        "spd": round(s_repos / 10 * 100),
     }
-    bar_pct = {k: round(v / cap * 100) for k, (v, cap) in bar_weights.items()}
-    bar_value = {
-        "pow": f"{fmt_num(total_stars)} / {fmt_num(total_commits)}",
-        "def": f"{fmt_num(followers)} / {fmt_num(total_issues)}",
-        "spd": f"{fmt_num(total_forks)} / {fmt_num(total_prs)}",
+    
+    metrics_map = {
+        "stars": fmt_num(total_stars),
+        "followers": fmt_num(followers),
+        "repos": fmt_num(public_repos)
     }
 
     lang_totals = {}
@@ -221,7 +189,7 @@ def gather_profile(login, token=None):
         lang = r.get("language")
         if lang:
             lang_totals[lang] = lang_totals.get(lang, 0) + 1
-    lang_entries = sorted(lang_totals.items(), key=lambda kv: -kv[1])[:5]
+    lang_entries = sorted(lang_totals.items(), key=lambda kv: -kv[1])[:4]
     lang_total_count = sum(c for _, c in lang_entries) or 1
     languages = [
         {"name": name, "pct": round(count / lang_total_count * 100), "color": color_for_lang(name)}
@@ -231,7 +199,6 @@ def gather_profile(login, token=None):
 
     avatar_uri = fetch_avatar_data_uri(user["avatar_url"])
 
-    # deterministic pseudo commit-hash, same recipe as the web version
     seed = f"{login}-{score}"
     h = 0
     for ch in seed:
@@ -245,21 +212,14 @@ def gather_profile(login, token=None):
         "bio": user.get("bio") or "",
         "location": user.get("location"),
         "avatar_uri": avatar_uri,
-        "followers": followers,
-        "public_repos": public_repos,
-        "total_stars": total_stars,
-        "total_forks": total_forks,
-        "total_commits": total_commits,
-        "total_prs": total_prs,
-        "total_issues": total_issues,
-        "account_age_years": account_age_years,
         "score": score,
         "bar_pct": bar_pct,
-        "bar_value": bar_value,
+        "metrics_map": metrics_map,
         "hash": commit_hash,
         "collector_no": collector_no,
         "languages": languages,
         "top_lang": top_lang,
+        "account_age_years": account_age_years
     }
 
 
@@ -288,15 +248,23 @@ def fmt_num(n):
     return str(n)
 
 
-def stat_bar(x, y, w, label, value_display, pct, color):
-    pct = max(0, min(100, pct))
-    bar_w = w - 150  # narrower bar, wider value column to fit combined "X / Y" values
+def render_stat_group(x, y, group_label, metric_val, bar_pct, color):
+    pct = max(0, min(100, bar_pct))
+    bar_w = 190
     fill_w = bar_w * pct / 100
+    
     return f"""
-    <text x="{x}" y="{y+13}" font-family="'IBM Plex Mono',monospace" font-size="12" font-weight="700" fill="#4A5568">{esc(label)}</text>
-    <rect x="{x+62}" y="{y+3}" width="{bar_w}" height="10" rx="5" fill="#DDE3E8"/>
-    <rect x="{x+62}" y="{y+3}" width="{fill_w:.1f}" height="10" rx="5" fill="{color}"/>
-    <text x="{x+62+bar_w+10}" y="{y+13}" font-family="'IBM Plex Mono',monospace" font-size="12" font-weight="700" fill="#14213D" text-anchor="start">{esc(value_display)}</text>
+    <g transform="translate({x}, {y})">
+      <text x="0" y="20" font-family="system-ui, sans-serif" font-size="12" font-weight="900" fill="#FFFFFF" letter-spacing="0.05em">{esc(group_label)}</text>
+      
+      <rect x="52" y="10" width="{bar_w}" height="10" rx="3" fill="#1E293B"/>
+      <rect x="52" y="10" width="{fill_w:.1f}" height="10" rx="3" fill="{color}"/>
+      
+      <g transform="translate(262, 0)">
+        <rect x="0" y="0" width="84" height="26" rx="5" fill="#0F172A" stroke="#334155" stroke-width="1"/>
+        <text x="42" y="17" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="900" fill="#38BDF8">{esc(metric_val)}</text>
+      </g>
+    </g>
     """
 
 
@@ -304,136 +272,132 @@ def build_svg(data):
     W, H = 400, 560
     score = data["score"]
     rarity = rarity_for(score)
-    c_light, c_dark = rarity["colors"]
+    c_1, c_2, c_3 = rarity["colors"]
     level = max(1, min(99, round(data["account_age_years"] * 10)))
     top_lang = data["top_lang"]
     card_type = type_for_lang(top_lang) if top_lang else "Unranked"
 
     name_line = data["name"]
-    if len(name_line) > 22:
-        name_line = name_line[:21].rstrip() + "…"
+    if len(name_line) > 20:
+        name_line = name_line[:19].rstrip() + "…"
 
-    bio_lines = wrap(data["bio"], width=34, max_lines=2)
-
+    bio_lines = wrap(data["bio"], width=42, max_lines=2)
     avatar_href = data["avatar_uri"] or ""
-    ART_TOP, ART_H = 72, 162  # back up from 138 now that only 3 blended stat rows are needed below
-    avatar_block = ""
+    
+    ART_TOP, ART_H = 76, 150  
+    TYPE_TOP = ART_TOP + ART_H + 10       
+    STATS_TOP = TYPE_TOP + 28 + 10        
+    STATS_H = 126                         
+    ABILITY_TOP = STATS_TOP + STATS_H + 10   
+    ABILITY_H = 54
+
     if avatar_href:
-        avatar_block = f'<image href="{avatar_href}" x="28" y="{ART_TOP+4}" width="344" height="{ART_H-8}" preserveAspectRatio="xMidYMid slice" clip-path="url(#artClip)"/>'
+        avatar_block = f'<image href="{avatar_href}" x="20" y="{ART_TOP}" width="360" height="{ART_H}" preserveAspectRatio="xMidYMid slice" clip-path="url(#artClip)"/>'
     else:
         avatar_block = (
-            f'<rect x="28" y="{ART_TOP+4}" width="344" height="{ART_H-8}" fill="#DDE3E8"/>'
-            f'<text x="200" y="{ART_TOP+ART_H/2+5:.0f}" text-anchor="middle" font-family="\'IBM Plex Mono\',monospace" '
-            'font-size="14" fill="#4A5568">no avatar</text>'
+            f'<rect x="20" y="{ART_TOP}" width="360" height="{ART_H}" fill="#1E293B" rx="12"/>'
+            f'<text x="200" y="{ART_TOP + ART_H/2 + 5:.0f}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#64748B" letter-spacing="0.05em">AVATAR OFFLINE</text>'
         )
 
+    # Dynamic auto-sizing language indicators
     languages = data["languages"]
-    pip_gap = 8
-    pip_w = (352 - pip_gap * (max(len(languages), 1) - 1)) / max(len(languages), 1) if languages else 352
-    pip_w = min(pip_w, 90)
     pips_svg = ""
-    total_pip_w = len(languages) * pip_w + (len(languages) - 1) * pip_gap if languages else 0
-    px = 200 - total_pip_w / 2
-    PIPS_Y = 490
-    for lang in languages:
-        pips_svg += f"""
-        <g transform="translate({px:.1f},0)">
-          <circle cx="7" cy="{PIPS_Y}" r="5" fill="{lang['color']}"/>
-          <text x="17" y="{PIPS_Y+4}" font-family="'IBM Plex Mono',monospace" font-size="10" fill="#4A5568">{esc(lang['name'][:8])} {lang['pct']}%</text>
-        </g>"""
-        px += pip_w + pip_gap
+    if languages:
+        total_langs = len(languages)
+        gap = 8
+        total_gap = gap * (total_langs - 1)
+        badge_w = min((360 - total_gap) / total_langs, 84)
+        start_x = 200 - ((badge_w * total_langs + total_gap) / 2)
+        PIPS_Y = 498
+        
+        for i, lang in enumerate(languages):
+            bx = start_x + i * (badge_w + gap)
+            pips_svg += f"""
+            <g transform="translate({bx:.1f}, {PIPS_Y})">
+              <rect x="0" y="0" width="{badge_w:.1f}" height="22" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
+              <circle cx="10" cy="11" r="3.5" fill="{lang['color']}"/>
+              <text x="18" y="14" font-family="system-ui, sans-serif" font-size="9" font-weight="800" fill="#E2E8F0">{esc(lang['name'].upper())}</text>
+            </g>"""
 
-    # --- fixed layout slots (avoids any dynamic overlap between sections) ---
-    TYPE_TOP = ART_TOP + ART_H + 6      # 216
-    STATS_TOP = TYPE_TOP + 26 + 12       # 254
-    STATS_H = 114                        # room for a label + 3 blended stat rows
-    ABILITY_TOP = STATS_TOP + STATS_H + 8   # 400
-    ABILITY_H = 70
-
-    bar_pct = data["bar_pct"]
-    bar_value = data["bar_value"]
+    mm = data["metrics_map"]
+    bp = data["bar_pct"]
+    
     stats_svg = ""
-    stat_rows = [
-        ("POW", bar_value["pow"], bar_pct["pow"], "#2DA44E"),
-        ("DEF", bar_value["def"], bar_pct["def"], "#1D4ED8"),
-        ("SPD", bar_value["spd"], bar_pct["spd"], "#B8860B"),
-    ]
-    row_gap = (STATS_H - 18) / len(stat_rows)
-    for i, (label, value, row_pct, color) in enumerate(stat_rows):
-        row_y = STATS_TOP + 18 + i * row_gap
-        stats_svg += stat_bar(28, row_y, 344, label, value, row_pct, color)
+    stats_svg += render_stat_group(28, STATS_TOP + 22, "STR", mm["stars"], bp["pow"], "#F43F5E")
+    stats_svg += render_stat_group(28, STATS_TOP + 54, "FOL", mm["followers"], bp["def"], "#3B82F6")
+    stats_svg += render_stat_group(28, STATS_TOP + 86, "REP", mm["repos"], bp["spd"], "#10B981")
 
-    bio_top = ABILITY_TOP + 16
+    bio_top = ABILITY_TOP + 18
     bio_svg = ""
     if bio_lines:
         for i, line in enumerate(bio_lines):
-            bio_svg += f'<text x="40" y="{bio_top + i*16}" font-family="Inter, sans-serif" font-size="12.5" fill="#14213D">{esc(line)}</text>'
+            bio_svg += f'<text x="36" y="{bio_top + i*14}" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#94A3B8">{esc(line)}</text>'
     else:
-        bio_svg = f'<text x="40" y="{bio_top}" font-family="Inter, sans-serif" font-size="12.5" fill="#4A5568" font-style="italic">No bio provided.</text>'
+        bio_svg = f'<text x="36" y="{bio_top + 4}" font-family="system-ui, sans-serif" font-size="11" fill="#475569" font-style="italic">No developer manifesto specified.</text>'
 
-    ability_line = "Passive: stat bars show profile stat / activity stat (e.g. stars / commits)."
-    ability_line_y = ABILITY_TOP + ABILITY_H - 10
-
-    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    svg = f"""<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+    svg = f"""<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="rarityGrad" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="{c_light}"/>
-      <stop offset="100%" stop-color="{c_dark}"/>
+    <linearGradient id="cyberGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="{c_1}"/>
+      <stop offset="50%" stop-color="{c_2}"/>
+      <stop offset="100%" stop-color="{c_3}"/>
     </linearGradient>
+    <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
     <clipPath id="artClip">
-      <rect x="28" y="{ART_TOP+4}" width="344" height="{ART_H-8}" rx="10"/>
+      <rect x="20" y="{ART_TOP}" width="360" height="{ART_H}" rx="12"/>
     </clipPath>
   </defs>
 
-  <!-- outer rarity border -->
-  <rect x="4" y="4" width="{W-8}" height="{H-8}" rx="24" fill="url(#rarityGrad)"/>
-  <!-- inner card body -->
-  <rect x="13" y="13" width="{W-26}" height="{H-26}" rx="18" fill="#F3F1E9" stroke="#C7D0D8" stroke-width="1"/>
+  <rect x="4" y="4" width="{W-8}" height="{H-8}" rx="24" fill="url(#cyberGrad)"/>
+  <rect x="12" y="12" width="{W-24}" height="{H-24}" rx="18" fill="#0B0F19" stroke="#1E293B" stroke-width="1.5"/>
 
-  <!-- header -->
-  <text x="30" y="42" font-family="'IBM Plex Mono',monospace" font-size="18" font-weight="700" fill="#14213D">{esc(name_line)}</text>
-  <text x="30" y="58" font-family="'IBM Plex Mono',monospace" font-size="11" fill="#4A5568">@{esc(data['login'])}</text>
-  <circle cx="365" cy="40" r="22" fill="url(#rarityGrad)"/>
-  <text x="365" y="45" text-anchor="middle" font-family="'IBM Plex Mono',monospace" font-size="18" font-weight="800" fill="{rarity['text']}">{score}</text>
+  <g transform="translate(24, 30)">
+    <text x="0" y="16" font-family="system-ui, sans-serif" font-size="20" font-weight="900" fill="#FFFFFF" letter-spacing="-0.01em">{esc(name_line).upper()}</text>
+    <text x="0" y="31" font-family="monospace" font-size="11" font-weight="700" fill="#38BDF8">@{esc(data['login']).upper()}</text>
+  </g>
+  
+  <circle cx="360" cy="44" r="20" fill="url(#cyberGrad)" filter="url(#neonGlow)"/>
+  <text x="360" y="50" text-anchor="middle" font-family="system-ui, sans-serif" font-size="16" font-weight="900" fill="{rarity['text']}">{score}</text>
 
-  <!-- art frame -->
-  <rect x="24" y="{ART_TOP}" width="352" height="{ART_H}" rx="14" fill="url(#rarityGrad)"/>
-  {avatar_block}
+  <g filter="url(#neonGlow)">
+    <rect x="18" y="{ART_TOP-2}" width="364" height="{ART_H+4}" rx="14" fill="url(#cyberGrad)" opacity="0.4"/>
+    {avatar_block}
+  </g>
 
-  <!-- type line -->
-  <rect x="24" y="{TYPE_TOP}" width="352" height="26" rx="6" fill="#E9EDF0" stroke="#C7D0D8" stroke-width="1"/>
-  <text x="34" y="{TYPE_TOP+17}" font-family="'IBM Plex Mono',monospace" font-size="12" font-weight="600" fill="#14213D">GitHub Developer — {esc(card_type)} Type</text>
-  <text x="366" y="{TYPE_TOP+17}" text-anchor="end" font-family="'IBM Plex Mono',monospace" font-size="12" font-weight="700" fill="#4A5568">Lv.{level}</text>
+  <g filter="url(#neonGlow)">
+    <rect x="20" y="{TYPE_TOP}" width="360" height="28" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
+    <text x="32" y="{TYPE_TOP+18}" font-family="system-ui, sans-serif" font-size="11" font-weight="900" fill="#F8FAFC" letter-spacing="0.05em">CLASS // {esc(card_type).upper()} TYPE</text>
+    <rect x="324" y="{TYPE_TOP+5}" width="46" height="18" rx="4" fill="url(#cyberGrad)"/>
+    <text x="347" y="{TYPE_TOP+17}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" font-weight="900" fill="{rarity['text']}">LV.{level}</text>
+  </g>
 
-  <!-- stat block -->
-  <rect x="24" y="{STATS_TOP}" width="352" height="{STATS_H}" rx="10" fill="#FFFFFF" stroke="#C7D0D8" stroke-width="1"/>
-  <text x="34" y="{STATS_TOP+13}" font-family="'IBM Plex Mono',monospace" font-size="11" font-weight="700" fill="#4A5568">// STATS</text>
-  {stats_svg}
+  <g filter="url(#neonGlow)">
+    <rect x="20" y="{STATS_TOP}" width="360" height="{STATS_H}" rx="12" fill="#0F172A" opacity="0.85" stroke="#1E293B" stroke-width="1"/>
+    <text x="32" y="{STATS_TOP+15}" font-family="system-ui, sans-serif" font-size="9" font-weight="900" fill="#64748B" letter-spacing="0.1em">CORE DECK METRICS</text>
+    {stats_svg}
+  </g>
 
-  <!-- ability box -->
-  <rect x="24" y="{ABILITY_TOP}" width="352" height="{ABILITY_H}" rx="10" fill="#FFFFFF" stroke="#C7D0D8" stroke-width="1"/>
-  {bio_svg}
-  <text x="40" y="{ability_line_y}" font-family="Inter, sans-serif" font-size="11" fill="#4A5568" font-style="italic">{esc(ability_line)}</text>
+  <g filter="url(#neonGlow)">
+    <rect x="20" y="{ABILITY_TOP}" width="360" height="{ABILITY_H}" rx="12" fill="#0F172A" opacity="0.85" stroke="#1E293B" stroke-width="1"/>
+    {bio_svg}
+  </g>
 
-  <!-- language pips -->
   {pips_svg}
 
-  <!-- footer -->
-  <rect x="24" y="500" width="352" height="28" rx="8" fill="url(#rarityGrad)"/>
-  <text x="36" y="518" font-family="'IBM Plex Mono',monospace" font-size="12" font-weight="800" fill="{rarity['text']}">{rarity['letter']} · {esc(rarity['name'])}</text>
-  <text x="200" y="518" text-anchor="middle" font-family="'IBM Plex Mono',monospace" font-size="10" fill="{rarity['text']}">#{esc(data['hash'])}</text>
-  <text x="364" y="518" text-anchor="end" font-family="'IBM Plex Mono',monospace" font-size="10" fill="{rarity['text']}">No. {data['collector_no']:03d}/999</text>
-
-  <text x="200" y="540" text-anchor="middle" font-family="'IBM Plex Mono',monospace" font-size="8" fill="#4A5568">git score TCG · generated {generated}</text>
+  <g transform="translate(24, 532)">
+    <text x="0" y="0" font-family="system-ui, sans-serif" font-size="11" font-weight="900" fill="url(#cyberGrad)" letter-spacing="0.06em">{rarity['letter']} · {esc(rarity['name'])}</text>
+    <text x="176" y="0" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" fill="#475569">#{esc(data['hash'])}</text>
+    <text x="352" y="0" text-anchor="end" font-family="system-ui, sans-serif" font-size="10" font-weight="800" fill="#64748B">NO. {data['collector_no']:03d}/999</text>
+  </g>
 </svg>
 """
     return svg
 
 
 # ----------------------------------------------------------------------------
-# Main
+# Main Implementation
 # ----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Generate a git-score TCG card for a GitHub user.")
@@ -476,16 +440,15 @@ def main():
                 cairosvg.svg2png(bytestring=svg.encode("utf-8"), write_to=png_path, output_width=800, output_height=1120)
                 print(f"Wrote {png_path}")
             if "jpg" in formats:
-                # cairosvg writes PNG bytes; flatten onto a white background then save as JPEG.
                 from io import BytesIO
                 from PIL import Image
 
                 png_bytes = cairosvg.svg2png(bytestring=svg.encode("utf-8"), output_width=800, output_height=1120)
                 img = Image.open(BytesIO(png_bytes)).convert("RGBA")
-                bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                bg = Image.new("RGBA", img.size, (11, 15, 25, 255))
                 bg.paste(img, mask=img)
                 jpg_path = os.path.join(args.out_dir, f"{args.username}.jpg")
-                bg.convert("RGB").save(jpg_path, "JPEG", quality=92)
+                bg.convert("RGB").save(jpg_path, "JPEG", quality=95)
                 print(f"Wrote {jpg_path}")
 
 
